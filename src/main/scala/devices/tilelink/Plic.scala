@@ -65,6 +65,23 @@ object PLICConsts
   require(hartBase >= enableBase(maxMaxHarts))
 }
 
+/* Secure interrupt extension register offsets (PLIC_S_IRQ spec).
+ * Carved out of the unused TL window between the enable array and hartBase.
+ * All registers are M-mode only by convention; software protection comes from PMP.
+ * Capacity limits (<=1023 sources, <=64 contexts / 32 harts) bound the reserved
+ * address ranges only: registers are instantiated per actual config (2-core
+ * tapeout gets 2 world_state / 4 irq_track regs). Offsets are deliberately
+ * config-independent so one set of software constants covers all SoCs. */
+object PLICSecConsts
+{
+  def secSrcBase     = 0x4000  // security attribute bitmap, 1 bit per source
+  def secCtrlOffset  = 0x4100  // {lock, secure_routing_en}
+  def worldStateBase = 0x4200  // per hart, 8-byte stride, up to 32 harts
+  def wsAckBase      = 0x4400  // per hart, 8-byte stride, up to 32 harts
+  def irqTrackBase   = 0x4600  // per context, 8-byte stride, up to 64 contexts
+  def secStatusOffset= 0x4E00  // sticky error flags, W1C
+}
+
 case class PLICParams(baseAddress: BigInt = 0xC000000, maxPriorities: Int = 7, intStages: Int = 0, maxHarts: Int = PLICConsts.maxMaxHarts)
 {
   require (maxPriorities >= 0)
@@ -179,14 +196,89 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
     val enables = Seq.fill(nHarts) { enableRegs }
     val enableVec = VecInit(enables.map(x => Cat(x.reverse)))
     val enableVec0 = VecInit(enableVec.map(x => Cat(x, 0.U(1.W))))
-    
+
+    /* ------------------------------------------------------------------ *
+     * Secure interrupt extension (PLIC_S_IRQ spec):
+     *  - secSrc(i)   : security attribute of source i+1 (0=NS, 1=secure)
+     *  - secCtrl     : {lock, secure_routing_en}; routing is legacy
+     *                  pass-through until secure_routing_en is set
+     *  - worldState  : per-hart S-world mirror (0=REE, 1=TEE); hart h's
+     *                  M-context (2h) and S-context (2h+1) share entry h
+     *  - irqTrack(c) : per-context in-service state {15:2 irq_id, 1 req_sec, 0 in_service}
+     *  - secStatus   : sticky error flags for rejected completes
+     * ------------------------------------------------------------------ */
+    val nRealHarts    = (nHarts + 1) / 2
+    // sec_src is stored as fixed 8-bit chunks (mirrors the enables layout) so
+    // every write path is a whole-chunk connect; the lock freezes all chunks
+    require(nDevices % 8 == 0,
+      s"Must be: nDevices=${nDevices} must be a multiple of 8 (sec_src byte-chunk layout)")
+    val secSrcChunks     = Seq.fill(nDevices / 8) { RegInit(0.U(8.W)) }
+    val secSrcChunksNext = secSrcChunks.map(c => WireDefault(c))
+    (secSrcChunks zip secSrcChunksNext).foreach { case (c, n) => c := n }
+    val secSrc        = Cat(secSrcChunks.reverse)  // bit i <-> source i+1
+    val secCtrl       = RegInit(0.U(2.W))
+    val secEnable     = secCtrl(0)  // 1: security routing active, 0: legacy pass-through
+    val secLocked     = secCtrl(1)  // 1: security config frozen until reset (W1T)
+    val secCtrlNext   = WireDefault(secCtrl)
+    secCtrl := secCtrlNext
+    // decoupled write port filled by the sec_ctrl register field below
+    val secCtrlWrValid = WireDefault(false.B)
+    val secCtrlWrData  = WireDefault(0.U(2.W))
+    when (secCtrlWrValid) {
+      // bit1 (lock) is W1T sticky; bit0 (routing enable) is writable until locked
+      secCtrlNext := Cat(secCtrl(1) | secCtrlWrData(1),
+                         Mux(secLocked, secCtrl(0), secCtrlWrData(0)))
+    }
+    val worldState    = RegInit(VecInit(Seq.fill(nRealHarts)(false.B)))
+    val irqTrack      = RegInit(VecInit(Seq.fill(nHarts)(0.U(32.W))))
+    val secStatus     = RegInit(0.U(4.W))
+    val secCompleteReject = WireDefault(false.B)
+    // sticky bit0 latches rejected completes (whole-word form: Chisel 6 forbids
+    // bit-slice reassignment); W1C clears via the register field below
+    val secStatusNext = WireDefault(Cat(secStatus(3, 1), secStatus(0) | secCompleteReject))
+    secStatus := secStatusNext
+
+    require (log2Ceil(nDevices + 1) <= 14,
+      s"Must be: log2Ceil(nDevices+1)=${log2Ceil(nDevices + 1)} <= 14 (irqTrack irq_id field)")
+    require (PLICConsts.enableBase(nHarts) <= PLICSecConsts.secSrcBase,
+      s"Must be: PLICConsts.enableBase(${nHarts})=${PLICConsts.enableBase(nHarts)} <= PLICSecConsts.secSrcBase=${PLICSecConsts.secSrcBase}")
+    require (PLICSecConsts.irqTrackBase + 8 * nHarts <= PLICSecConsts.secStatusOffset,
+      s"irq_track region must not overlap sec_status (nHarts=${nHarts} too large)")
+    require (PLICSecConsts.worldStateBase + 8 * nRealHarts <= PLICSecConsts.wsAckBase,
+      s"world_state region must not overlap ws_ack (nRealHarts=${nRealHarts} too large)")
+
     val maxDevs = Reg(Vec(nHarts, UInt(log2Ceil(nDevices+1).W)))
     val pendingUInt = Cat(pending.reverse)
+    // Security attribute indexed by PLIC id; bit 0 (reserved id 0) reads 0
+    val secSrcById = Cat(0.U(1.W), secSrc)
+    // Hart-wide secure busy: any context (M=2h, S=2h+1) of hart h servicing a
+    // secure interrupt. The M-context mask uses it so that non-secure sources
+    // cannot even trap into M while TEE services a secure interrupt claimed
+    // directly on the S-context (hardware non-preemption, PLIC_S_IRQ §5).
+    val secBusyOfCtx = VecInit((0 until nHarts).map(c => irqTrack(c)(0) && irqTrack(c)(1)))
+    val secBusyHart  = VecInit(Seq.tabulate(nRealHarts) { h =>
+      val mBusy = secBusyOfCtx(2 * h)
+      val sBusy = if (2 * h + 1 < nHarts) secBusyOfCtx(2 * h + 1) else false.B
+      mBusy || sBusy
+    })
     if(nDevices > 0) {
       for (hart <- 0 until nHarts) {
         val fanin = Module(new PLICFanIn(nDevices, prioBits))
         fanin.io.prio := priority
-        fanin.io.ip := enableVec(hart) & pendingUInt
+        // Route mask per PLIC_S_IRQ §5:
+        //   S-world ctx (odd):  to_S  = (sec_src == world_state)
+        //   M ctx (even):       to_M  = ~to_S & ~(sec_busy_hart & ~sec_src)
+        // When secure routing is disabled every source passes (legacy PLIC).
+        val hartIdx     = hart / 2
+        val isSecureCtx = (hart % 2) == 1
+        val toS = Mux(worldState(hartIdx), secSrc, ~secSrc)
+        // to_M = ~to_S & ~(sec_busy_hart & ~sec_src): while any context of
+        // this hart services a secure interrupt, non-secure sources are
+        // blocked at M (no M-mode trap until the matching complete)
+        val toM = ~toS & Mux(secBusyHart(hartIdx), secSrc, Fill(nDevices, 1.U(1.W)))
+        val ctxRoute = if (isSecureCtx) toS else toM
+        fanin.io.ip := enableVec(hart) & pendingUInt &
+                       Mux(secEnable, ctxRoute, Fill(nDevices, 1.U(1.W)))
         maxDevs(hart) := fanin.io.dev
         harts(hart) := ShiftRegister(RegNext(fanin.io.max) > threshold(hart), params.intStages)
       }
@@ -250,6 +342,16 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
     val claiming = Seq.tabulate(nHarts){i => Mux(claimer(i), maxDevs(i), 0.U)}.reduceLeft(_|_)
     val claimedDevs = VecInit(UIntToOH(claiming, nDevices+1).asBools)
 
+    // Latch per-context in-service state on claim (PLIC_S_IRQ §7).
+    // {15:2 irq_id, 1 req_sec, 0 in_service}; id 0 (nothing claimable) does not latch.
+    val trackIdBits = log2Ceil(nDevices + 1)
+    for (i <- 0 until nHarts) {
+      when (claimer(i) && maxDevs(i) =/= 0.U) {
+        irqTrack(i) := Cat(0.U((30 - trackIdBits).W), maxDevs(i),
+                           secSrcById(maxDevs(i)), 1.U(1.W))
+      }
+    }
+
     ((pending zip gateways) zip claimedDevs.tail) foreach { case ((p, g), c) =>
       g.ready := !p
       when (c || g.valid) { p := !c }
@@ -296,7 +398,23 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
             assert(Mux(valid, completerDev === data.extract(log2Ceil(nDevices+1)-1, 0), true.B),
                    "completerDev should be consistent for all harts")
             completerDev := data.extract(log2Ceil(nDevices+1)-1, 0)
-            completer(i) := valid && enableVec0(i)(completerDev)
+            // Complete check (PLIC_S_IRQ §7): data bit31 carries the NS/S flag
+            // supplied by the completer. The write is honored only when it
+            // matches the state latched at claim time (in_service, id, sec).
+            // Legacy (secure routing disabled) keeps the unfiltered behavior.
+            val completeReqSec = data(31)
+            val trackOk = irqTrack(i)(0) &&
+                          irqTrack(i)(15, 2) === completerDev &&
+                          irqTrack(i)(1) === completeReqSec
+            val completeAccept = valid && enableVec0(i)(completerDev) &&
+                                 (!secEnable || trackOk)
+            completer(i) := completeAccept
+            when (completeAccept) {
+              irqTrack(i) := irqTrack(i) & ~1.U(32.W) // clear in_service
+            }
+            when (valid && !completeAccept && secEnable) {
+              secCompleteReject := true.B // empty / replay / id or flag mismatch
+            }
             true.B
           },
           Some(RegFieldDesc(s"claim_complete_$i",
@@ -310,7 +428,84 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
       )
     }
 
-    node.regmap((priorityRegFields ++ pendingRegFields ++ enableRegFields ++ hartRegFields):_*)
+    /* ------------------ Security extension fields (PLIC_S_IRQ) ------------------ */
+
+    // sec_src bitmap, one 8-bit field per chunk; writes ignored once locked
+    def secSrcField(b: Int): RegField = {
+      val lo = b * 8
+      RegField(8,
+        RegReadFn { _ => (true.B, secSrcChunks(b)) },
+        RegWriteFn { (valid, data) =>
+          when (valid && !secLocked) { secSrcChunksNext(b) := data }
+          true.B
+        },
+        Some(RegFieldDesc(s"sec_src_$b",
+          s"Security attribute of interrupt sources ${lo+1}-${lo+8}. 1=secure, 0=non-secure. Read-only after lock.",
+          group = Some("sec_src"),
+          groupDesc = Some("Security attribute per interrupt source."))))
+    }
+    val secSrcRegField = PLICSecConsts.secSrcBase ->
+      (0 until nDevices / 8).map(secSrcField)
+
+    // sec_ctrl: routing enable is lockable, lock itself is W1T sticky
+    val secCtrlRegField = PLICSecConsts.secCtrlOffset -> Seq(RegField(2,
+      RegReadFn { _ => (true.B, secCtrl) },
+      RegWriteFn { (valid, data) =>
+        when (valid) {
+          secCtrlWrValid := true.B
+          secCtrlWrData  := data(1, 0)
+        }
+        true.B
+      },
+      Some(RegFieldDesc("sec_ctrl",
+        "bit0: enable security routing (0=legacy pass-through). bit1: lock security config (W1T).",
+        group = Some("security"),
+        groupDesc = Some("Secure interrupt routing control.")))))
+
+    // world_state per hart; ws_ack echoes the committed value one cycle later
+    val wsEcho = RegNext(worldState)
+    val wsDone = VecInit((0 until nRealHarts).map(h => RegNext(wsEcho(h) === worldState(h))))
+    val worldStateRegFields = Seq.tabulate(nRealHarts) { h =>
+      PLICSecConsts.worldStateBase + 8 * h -> Seq(RegField(1, worldState(h),
+        RegFieldDesc(s"world_state_$h",
+          s"S-world of hart $h mirrored in PLIC (0=REE, 1=TEE). Write only on a real world switch.",
+          group = Some("security"))))
+    }
+    val wsAckRegFields = Seq.tabulate(nRealHarts) { h =>
+      PLICSecConsts.wsAckBase + 8 * h -> Seq(RegField.r(8, Cat(wsDone(h), 0.U(6.W), wsEcho(h)),
+        RegFieldDesc(s"ws_ack_$h",
+          "bit0: committed world_state echo; bit7: echo stable (hardware ACK for the world switch).",
+          group = Some("security"),
+          volatile = true)))
+    }
+
+    // irq_track read-only debug/observability per context
+    val irqTrackRegFields = Seq.tabulate(nHarts) { i =>
+      PLICSecConsts.irqTrackBase + 8 * i -> Seq(RegField.r(32, irqTrack(i),
+        RegFieldDesc(s"irq_track_$i",
+          s"In-service tracking of context $i: {15:2 irq_id, 1 req_sec, 0 in_service}.",
+          group = Some("security"),
+          volatile = true)))
+    }
+
+    // sec_status: sticky error flags, write-1-to-clear.
+    // Reads the register (not secStatusNext) to avoid a combinational loop
+    // through the regmapper write path; a reject coincident with the W1C
+    // write is dropped, which is harmless.
+    val secStatusRegField = PLICSecConsts.secStatusOffset -> Seq(RegField(4,
+      RegReadFn { _ => (true.B, secStatus) },
+      RegWriteFn { (valid, data) =>
+        when (valid) { secStatusNext := secStatus & ~data(3, 0) }
+        true.B
+      },
+      Some(RegFieldDesc("sec_status",
+        "bit0: complete rejected (no in-service interrupt / id or security mismatch / replay). W1C.",
+        group = Some("security"),
+        volatile = true))))
+
+    node.regmap((priorityRegFields ++ pendingRegFields ++ enableRegFields ++ hartRegFields ++
+      Seq(secSrcRegField, secCtrlRegField) ++ worldStateRegFields ++ wsAckRegFields ++
+      irqTrackRegFields :+ secStatusRegField):_*)
 
     if (nDevices >= 2) {
       val claimed = claimer(0) && maxDevs(0) > 0.U
