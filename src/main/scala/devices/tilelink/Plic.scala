@@ -229,7 +229,9 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
       secCtrlNext := Cat(secCtrl(1) | secCtrlWrData(1),
                          Mux(secLocked, secCtrl(0), secCtrlWrData(0)))
     }
-    val worldState    = RegInit(VecInit(Seq.fill(nRealHarts)(false.B)))
+    // world_state resets to TEE, matching core-side mws: boot order is
+    // OpenSBI -> TEE init -> REE init, so the machine comes up secure.
+    val worldState    = RegInit(VecInit(Seq.fill(nRealHarts)(true.B)))
     val irqTrack      = RegInit(VecInit(Seq.fill(nHarts)(0.U(32.W))))
     val secStatus     = RegInit(0.U(4.W))
     val secCompleteReject = WireDefault(false.B)
