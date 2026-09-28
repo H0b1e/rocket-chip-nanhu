@@ -212,7 +212,15 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
     // every write path is a whole-chunk connect; the lock freezes all chunks
     require(nDevices % 8 == 0,
       s"Must be: nDevices=${nDevices} must be a multiple of 8 (sec_src byte-chunk layout)")
-    val secSrcChunks     = Seq.fill(nDevices / 8) { RegInit(0.U(8.W)) }
+    // Chunked like enableRegs (first chunk 7 bits, then 8-bit chunks) so the
+    // bus-side bitmap stays byte-aligned behind the reserved bit 0: absolute
+    // bus bit k <-> source id k, same convention as pending/enable.
+    val secSrcFirst = nDevices min 7
+    val secSrcFull  = (nDevices - secSrcFirst) / 8
+    val secSrcTail  = nDevices - secSrcFirst - 8 * secSrcFull
+    val secSrcChunks     = (RegInit(0.U(secSrcFirst.W)) +:
+                            Seq.fill(secSrcFull) { RegInit(0.U(8.W)) }) ++
+                           (if (secSrcTail > 0) Some(RegInit(0.U(secSrcTail.W))) else None)
     val secSrcChunksNext = secSrcChunks.map(c => WireDefault(c))
     (secSrcChunks zip secSrcChunksNext).foreach { case (c, n) => c := n }
     val secSrc        = Cat(secSrcChunks.reverse)  // bit i <-> source i+1
@@ -251,8 +259,10 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
 
     val maxDevs = Reg(Vec(nHarts, UInt(log2Ceil(nDevices+1).W)))
     val pendingUInt = Cat(pending.reverse)
-    // Security attribute indexed by PLIC id; bit 0 (reserved id 0) reads 0
-    val secSrcById = Cat(0.U(1.W), secSrc)
+    // Security attribute indexed by PLIC id; bit 0 (reserved id 0) reads 0.
+    // Same shift as enableVec0: secSrc bit i is source i+1, so the id-indexed
+    // form pads a zero at bit 0 (Cat puts its first argument in the high bits).
+    val secSrcById = Cat(secSrc, 0.U(1.W))
     // Hart-wide secure busy: any context (M=2h, S=2h+1) of hart h servicing a
     // secure interrupt. The M-context mask uses it so that non-secure sources
     // cannot even trap into M while TEE services a secure interrupt claimed
@@ -432,22 +442,26 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
 
     /* ------------------ Security extension fields (PLIC_S_IRQ) ------------------ */
 
-    // sec_src bitmap, one 8-bit field per chunk; writes ignored once locked
+    // sec_src bitmap, one field per chunk; writes ignored once locked.
+    // Chunk b holds secSrc bits [lo, lo+w) <-> sources lo+1 .. lo+w.
     def secSrcField(b: Int): RegField = {
-      val lo = b * 8
-      RegField(8,
+      val lo = secSrcChunks.take(b).map(_.getWidth).sum
+      val w  = secSrcChunks(b).getWidth
+      RegField(w,
         RegReadFn { _ => (true.B, secSrcChunks(b)) },
         RegWriteFn { (valid, data) =>
           when (valid && !secLocked) { secSrcChunksNext(b) := data }
           true.B
         },
         Some(RegFieldDesc(s"sec_src_$b",
-          s"Security attribute of interrupt sources ${lo+1}-${lo+8}. 1=secure, 0=non-secure. Read-only after lock.",
+          s"Security attribute of interrupt sources ${lo+1}-${lo+w}. 1=secure, 0=non-secure. Read-only after lock.",
           group = Some("sec_src"),
           groupDesc = Some("Security attribute per interrupt source."))))
     }
+    // Prepend a reserved bit 0 (like pending/enable) so the sec_src bitmap is
+    // id-indexed on the bus: absolute bit k <-> source id k.
     val secSrcRegField = PLICSecConsts.secSrcBase ->
-      (0 until nDevices / 8).map(secSrcField)
+      (RegField(1) +: (0 until secSrcChunks.length).map(secSrcField))
 
     // sec_ctrl: routing enable is lockable, lock itself is W1T sticky
     val secCtrlRegField = PLICSecConsts.secCtrlOffset -> Seq(RegField(2,
