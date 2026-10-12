@@ -76,8 +76,7 @@ object PLICSecConsts
 {
   def secSrcBase     = 0x4000  // security attribute bitmap, 1 bit per source
   def secCtrlOffset  = 0x4100  // {lock, secure_routing_en}
-  def worldStateBase = 0x4200  // per hart, 8-byte stride, up to 32 harts
-  def wsAckBase      = 0x4400  // per hart, 8-byte stride, up to 32 harts
+  def worldStateBase = 0x4200  // per hart, 8-byte stride, read-only live view
   def irqTrackBase   = 0x4600  // per context, 8-byte stride, up to 64 contexts
   def secStatusOffset= 0x4E00  // sticky error flags, W1C
 }
@@ -150,6 +149,12 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
     val (io_devices, edgesIn) = intnode.in.unzip
     val (io_harts, _) = intnode.out.unzip
 
+    // Per-hart live world state from the core-side mws CSR.
+    // Sampled through a synchronizer pair inside the fanin path; the value at
+    // 0x4200 is a read-only view of what routing actually uses.
+    val nRealHartsPorts = (nHarts + 1) / 2
+    val mws = IO(Input(Vec(nRealHartsPorts, Bool())))
+
     // Compact the interrupt vector the same way
     val interrupts = intnode.in.map { case (i, e) => i.take(e.source.num) }.flatten
     // This flattens the harts into an MSMSMSMSMS... or MMMMM.... sequence
@@ -202,8 +207,12 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
      *  - secSrc(i)   : security attribute of source i+1 (0=NS, 1=secure)
      *  - secCtrl     : {lock, secure_routing_en}; routing is legacy
      *                  pass-through until secure_routing_en is set
-     *  - worldState  : per-hart S-world mirror (0=REE, 1=TEE); hart h's
-     *                  M-context (2h) and S-context (2h+1) share entry h
+     *  - mws         : per-hart live world-state input sampled directly from
+     *                  the core-side mws CSR. Routing authority
+     *                  lives in the core; the PLIC holds no writable mirror,
+     *                  so the world-switch sync window of the MMIO-mirror
+     *                  era cannot exist. 0x4200 remains as a read-only
+     *                  observability view of the sampled value.
      *  - irqTrack(c) : per-context in-service state {15:2 irq_id, 1 req_sec, 0 in_service}
      *  - secStatus   : sticky error flags for rejected completes
      * ------------------------------------------------------------------ */
@@ -237,9 +246,12 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
       secCtrlNext := Cat(secCtrl(1) | secCtrlWrData(1),
                          Mux(secLocked, secCtrl(0), secCtrlWrData(0)))
     }
-    // world_state resets to TEE, matching core-side mws: boot order is
-    // OpenSBI -> TEE init -> REE init, so the machine comes up secure.
-    val worldState    = RegInit(VecInit(Seq.fill(nRealHarts)(true.B)))
+    // world_state is no longer a writable mirror: routing samples the live
+    // core-side mws input through a two-stage synchronizer. Reset
+    // value follows the mws CSR, which resets to TEE (boot order OpenSBI ->
+    // TEE init -> REE init, so the machine comes up secure).
+    val worldState    = VecInit(Seq.tabulate(nRealHarts)(h =>
+      RegNext(RegNext(mws(h), true.B), true.B)))
     val irqTrack      = RegInit(VecInit(Seq.fill(nHarts)(0.U(32.W))))
     val secStatus     = RegInit(0.U(4.W))
     val secCompleteReject = WireDefault(false.B)
@@ -254,8 +266,8 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
       s"Must be: PLICConsts.enableBase(${nHarts})=${PLICConsts.enableBase(nHarts)} <= PLICSecConsts.secSrcBase=${PLICSecConsts.secSrcBase}")
     require (PLICSecConsts.irqTrackBase + 8 * nHarts <= PLICSecConsts.secStatusOffset,
       s"irq_track region must not overlap sec_status (nHarts=${nHarts} too large)")
-    require (PLICSecConsts.worldStateBase + 8 * nRealHarts <= PLICSecConsts.wsAckBase,
-      s"world_state region must not overlap ws_ack (nRealHarts=${nRealHarts} too large)")
+    require (PLICSecConsts.worldStateBase + 8 * nRealHarts <= PLICSecConsts.irqTrackBase,
+      s"world_state region must not overlap irq_track (nRealHarts=${nRealHarts} too large)")
 
     val maxDevs = Reg(Vec(nHarts, UInt(log2Ceil(nDevices+1).W)))
     val pendingUInt = Cat(pending.reverse)
@@ -478,21 +490,14 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
         group = Some("security"),
         groupDesc = Some("Secure interrupt routing control.")))))
 
-    // world_state per hart; ws_ack echoes the committed value one cycle later
-    val wsEcho = RegNext(worldState)
-    val wsDone = VecInit((0 until nRealHarts).map(h => RegNext(wsEcho(h) === worldState(h))))
+    // world_state per hart: read-only live view of the sampled mws input
+    // The writable mirror and the ws_ack handshake are gone.
     val worldStateRegFields = Seq.tabulate(nRealHarts) { h =>
-      PLICSecConsts.worldStateBase + 8 * h -> Seq(RegField(1, worldState(h),
+      PLICSecConsts.worldStateBase + 8 * h -> Seq(RegField.r(1,
+        RegReadFn { _ => (true.B, worldState(h)) },
         RegFieldDesc(s"world_state_$h",
-          s"S-world of hart $h mirrored in PLIC (0=REE, 1=TEE). Write only on a real world switch.",
+          s"S-world of hart $h as sampled from the core-side mws CSR (0=REE, 1=TEE). Read-only.",
           group = Some("security"))))
-    }
-    val wsAckRegFields = Seq.tabulate(nRealHarts) { h =>
-      PLICSecConsts.wsAckBase + 8 * h -> Seq(RegField.r(8, Cat(wsDone(h), 0.U(6.W), wsEcho(h)),
-        RegFieldDesc(s"ws_ack_$h",
-          "bit0: committed world_state echo; bit7: echo stable (hardware ACK for the world switch).",
-          group = Some("security"),
-          volatile = true)))
     }
 
     // irq_track read-only debug/observability per context
@@ -520,7 +525,7 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
         volatile = true))))
 
     node.regmap((priorityRegFields ++ pendingRegFields ++ enableRegFields ++ hartRegFields ++
-      Seq(secSrcRegField, secCtrlRegField) ++ worldStateRegFields ++ wsAckRegFields ++
+      Seq(secSrcRegField, secCtrlRegField) ++ worldStateRegFields ++
       irqTrackRegFields :+ secStatusRegField):_*)
 
     if (nDevices >= 2) {
